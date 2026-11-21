@@ -7,6 +7,7 @@ import '../l10n/app_localizations.dart';
 import '../services/language_controller.dart';
 import '../services/studytrack_repository.dart';
 import '../services/notification_service.dart';
+import '../services/plan_service.dart';
 
 // =====================================================
 // COLORES INSTITUCIONALES
@@ -129,6 +130,28 @@ class _TasksScreenState extends State<TasksScreen> {
     ).showSnackBar(SnackBar(content: Text(mensaje)));
   }
 
+  Future<void> _mostrarLimiteTareas() async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(_t('Función Premium 🔒', 'Recurso Premium 🔒')),
+        content: Text(_t(
+          'El plan Free permite crear hasta 5 tareas.\n\n'
+          'Activá Premium para crear tareas ilimitadas.',
+          'O plano Free permite criar até 5 tarefas.\n\n'
+          'Ative o Premium para criar tarefas ilimitadas.',
+        )),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: Text(_t('Entendido', 'Entendi')),
+          ),
+        ],
+      ),
+    );
+  }
+
   // =====================================================
   // CREAR UNA TAREA EN FIREBASE Y PROGRAMAR SU AVISO
   // =====================================================
@@ -136,6 +159,29 @@ class _TasksScreenState extends State<TasksScreen> {
   Future<void> agregarTarea(StudyTrackRepository repositorio) async {
     if (guardando) return;
 
+    // El límite Free se calcula sobre las tareas persistidas en Firestore.
+    // Así no se reinicia al salir de esta pantalla.
+    Future<bool> tieneCupo() async {
+      final consulta = await repositorio.tareas.get();
+      return PlanService.puedeCrearTarea(consulta.docs.length);
+    }
+
+    try {
+      if (!await tieneCupo()) {
+        if (!mounted) return;
+        await _mostrarLimiteTareas();
+        return;
+      }
+    } catch (error) {
+      debugPrint('Error al verificar el plan de tareas: $error');
+      mostrarMensaje(_t(
+        'No se pudo verificar el límite de tareas.',
+        'Não foi possível verificar o limite de tarefas.',
+      ));
+      return;
+    }
+
+    if (!mounted) return;
     final resultado = await showDialog<Map<String, dynamic>>(
       context: context,
       builder: (context) => const _NuevaTareaDialog(),
@@ -168,6 +214,13 @@ class _TasksScreenState extends State<TasksScreen> {
     });
 
     try {
+      // Revalidar después del diálogo, por si se agregaron tareas
+      // desde otro dispositivo mientras el formulario estaba abierto.
+      if (!await tieneCupo()) {
+        if (mounted) await _mostrarLimiteTareas();
+        return;
+      }
+
       final idNotificacion = _generarIdNotificacion();
 
       // ==========================================
