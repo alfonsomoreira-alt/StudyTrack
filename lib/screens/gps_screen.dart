@@ -6,9 +6,11 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../l10n/app_localizations.dart';
 import '../services/notification_service.dart';
+import '../services/plan_service.dart';
 import 'notifications_screen.dart';
 
 enum ModoRuta { auto, pie }
@@ -43,6 +45,10 @@ class _GpsScreenState extends State<GpsScreen> {
 
   final FocusNode direccionFocus = FocusNode();
   final MapController mapController = MapController();
+  Timer? _debounce;
+  static const int limiteRutasGratis = 3;
+  final SharedPreferencesAsync _preferencias = SharedPreferencesAsync();
+  bool _comprobandoLimite = false;
 
   // ============================================
   // COLORES ADAPTATIVOS DE STUDYTRACK
@@ -164,6 +170,7 @@ class _GpsScreenState extends State<GpsScreen> {
 
   @override
   void dispose() {
+    _debounce?.cancel();
     direccionController.dispose();
     direccionFocus.dispose();
     super.dispose();
@@ -442,11 +449,13 @@ class _GpsScreenState extends State<GpsScreen> {
   // ============================================
 
   void alCambiarBusqueda(String texto) {
-    // Nominatim público no admite autocompletado
-    // automático. Se consulta al buscar.
-    setState(() {
-      sugerencias = [];
-    });
+    _debounce?.cancel();
+    final consulta = texto.trim();
+    setState(() => sugerencias = []);
+    if (consulta.length < 3) return;
+
+    // El servicio público Nominatim no permite autocompletado por pulsación.
+    // La búsqueda se realiza al tocar el botón o enviar el teclado.
   }
 
   Future<void> buscarSugerencias(String consulta) async {
@@ -657,7 +666,53 @@ class _GpsScreenState extends State<GpsScreen> {
     double latitudDestino,
     double longitudDestino,
   ) async {
-    if (posicionActual == null) return;
+    if (posicionActual == null || calculandoRuta || _comprobandoLimite) return;
+    _comprobandoLimite = true;
+    final fecha = DateTime.now();
+    final hoy = '${fecha.year}-${fecha.month}-${fecha.day}';
+    const claveFecha = 'studytrack_gps_fecha';
+    const claveContador = 'studytrack_gps_rutas';
+    int usadas = 0;
+    try {
+      final fechaGuardada = await _preferencias.getString(claveFecha);
+      usadas = fechaGuardada == hoy
+          ? (await _preferencias.getInt(claveContador) ?? 0)
+          : 0;
+      if (!PlanService.premiumActivo && usadas >= limiteRutasGratis) {
+        if (!mounted) return;
+        await showDialog<void>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(_t('🔒 Límite GPS alcanzado', '🔒 Limite de GPS atingido')),
+            content: Text(_t(
+              'Ya utilizaste tus 3 rutas gratuitas de hoy. Activá StudyTrack Premium para calcular rutas ilimitadas.',
+              'Você já utilizou suas 3 rotas gratuitas de hoje. Ative o StudyTrack Premium para calcular rotas ilimitadas.',
+            )),
+            actions: [TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: Text(_t('Entendido', 'Entendi')),
+            )],
+          ),
+        );
+        return;
+      }
+    
+    } catch (e) {
+      debugPrint('No se pudo consultar el contador GPS: $e');
+
+      if (mounted) {
+        mostrarMensaje(_t(
+          'No se pudo verificar el límite de rutas. Intentá de nuevo.',
+          'Não foi possível verificar o limite de rotas. Tente novamente.',
+        ));
+      }
+
+      return;
+    } finally {
+      _comprobandoLimite = false;
+    }
+
+    if (!mounted || posicionActual == null) return;
 
     setState(() {
       calculandoRuta = true;
@@ -733,6 +788,16 @@ class _GpsScreenState extends State<GpsScreen> {
 
         calculandoRuta = false;
       });
+
+      // Contabilizar únicamente rutas calculadas correctamente.
+      if (!PlanService.premiumActivo) {
+        try {
+          await _preferencias.setString(claveFecha, hoy);
+          await _preferencias.setInt(claveContador, usadas + 1);
+        } catch (e) {
+          debugPrint('No se pudo guardar el contador GPS: $e');
+        }
+      }
 
       if (puntos.isNotEmpty) {
         try {
@@ -1166,7 +1231,7 @@ class _GpsScreenState extends State<GpsScreen> {
     crossAxisAlignment: CrossAxisAlignment.stretch,
     children: [
       Text(
-        'BUSCAR DESTINO',
+        _t('BUSCAR DESTINO', 'BUSCAR DESTINO'),
         style: TextStyle(
           color: _acento,
           fontSize: 17,
