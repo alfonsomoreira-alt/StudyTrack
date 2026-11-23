@@ -1,19 +1,20 @@
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show kIsWeb;
+
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-
-import '../services/app_data.dart';
-
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:image/image.dart' as img;
 
 import '../l10n/app_localizations.dart';
+import '../services/app_data.dart';
 import '../services/api_client.dart';
 import '../services/language_controller.dart';
 import '../services/studytrack_repository.dart';
 import '../theme_controller.dart';
+import '../widgets/delete_account_dialog.dart';
 
 import 'login_screen.dart';
 import 'paywall_screen.dart';
@@ -190,8 +191,9 @@ class _ProfileScreenState extends State<ProfileScreen> {
   void _mensaje(String mensaje) {
     if (!mounted) return;
 
-    ScaffoldMessenger.of(context)
-        .showSnackBar(SnackBar(content: Text(mensaje)));
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(mensaje)));
   }
 
   Future<void> _informacion(String titulo, String contenido) async {
@@ -989,6 +991,314 @@ class _ProfileScreenState extends State<ProfileScreen> {
   }
 
   // =====================================================
+  // ELIMINAR CUENTA - VERIFICACIÓN DE IDENTIDAD
+  // =====================================================
+
+  Future<bool> _verificarIdentidadParaEliminar(User usuario) async {
+    final proveedores = usuario.providerData
+        .map((proveedor) => proveedor.providerId)
+        .toSet();
+
+    try {
+      if (proveedores.contains('google.com')) {
+        final proveedorGoogle = GoogleAuthProvider();
+        final resultado = kIsWeb
+            ? await usuario.reauthenticateWithPopup(proveedorGoogle)
+            : await usuario.reauthenticateWithProvider(proveedorGoogle);
+
+        return resultado.user?.uid == usuario.uid &&
+            FirebaseAuth.instance.currentUser?.uid == usuario.uid;
+      }
+
+      if (proveedores.contains('password')) {
+        final correo = usuario.email;
+        if (correo == null || correo.isEmpty || !mounted) return false;
+
+        String contrasenaIngresada = '';
+        final contrasena = await showDialog<String>(
+          context: context,
+          barrierDismissible: false,
+          builder: (dialogContext) => StatefulBuilder(
+            builder: (dialogContext, actualizarDialogo) => AlertDialog(
+              title: Text(_t('Verificar identidad', 'Verificar identidade')),
+              content: SizedBox(
+                width: 380,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.verified_user_outlined,
+                      color: bordo,
+                      size: 40,
+                    ),
+                    const SizedBox(height: 16),
+                    Text(
+                      _t(
+                        'Ingresá tu contraseña actual para confirmar '
+                            'que sos el propietario de esta cuenta.',
+                        'Digite sua senha atual para confirmar '
+                            'que você é o proprietário desta conta.',
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      obscureText: true,
+                      autocorrect: false,
+                      enableSuggestions: false,
+                      autofocus: true,
+                      decoration: InputDecoration(
+                        labelText: _t('Contraseña actual', 'Senha atual'),
+                        border: const OutlineInputBorder(),
+                        prefixIcon: const Icon(Icons.lock_outline),
+                      ),
+                      onChanged: (valor) {
+                        actualizarDialogo(() => contrasenaIngresada = valor);
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: Text(_textos.commonCancel),
+                ),
+                FilledButton(
+                  onPressed: contrasenaIngresada.isEmpty
+                      ? null
+                      : () => Navigator.pop(dialogContext, contrasenaIngresada),
+                  child: Text(_t('Verificar', 'Verificar')),
+                ),
+              ],
+            ),
+          ),
+        );
+
+        if (contrasena == null || contrasena.isEmpty) return false;
+        final resultado = await usuario.reauthenticateWithCredential(
+          EmailAuthProvider.credential(email: correo, password: contrasena),
+        );
+        return resultado.user?.uid == usuario.uid &&
+            FirebaseAuth.instance.currentUser?.uid == usuario.uid;
+      }
+
+      if (!mounted) return false;
+      await _informacion(
+        _t('Verificación no disponible', 'Verificação indisponível'),
+        _t(
+          'Este método de inicio de sesión todavía no permite '
+              'verificar la identidad para eliminar la cuenta.',
+          'Este método de login ainda não permite verificar '
+              'a identidade para excluir a conta.',
+        ),
+      );
+      return false;
+    } on FirebaseAuthException catch (error) {
+      if (!mounted) return false;
+      if (error.code == 'popup-closed-by-user' ||
+          error.code == 'cancelled-popup-request') {
+        return false;
+      }
+
+      final mensaje = switch (error.code) {
+        'wrong-password' || 'invalid-credential' => _t(
+          'Contraseña o credenciales incorrectas.',
+          'Senha ou credenciais incorretas.',
+        ),
+        'user-mismatch' => _t(
+          'La cuenta seleccionada no coincide con la actual.',
+          'A conta selecionada não corresponde à conta atual.',
+        ),
+        'too-many-requests' => _t(
+          'Demasiados intentos. Probá más tarde.',
+          'Muitas tentativas. Tente novamente mais tarde.',
+        ),
+        _ => _t(
+          'No se pudo verificar tu identidad. Intentá nuevamente.',
+          'Não foi possível verificar sua identidade. Tente novamente.',
+        ),
+      };
+      _mensaje(mensaje);
+      return false;
+    } catch (error) {
+      debugPrint('Error verificando identidad: $error');
+      if (mounted) {
+        _mensaje(
+          _t(
+            'No fue posible verificar tu identidad.',
+            'Não foi possível verificar sua identidade.',
+          ),
+        );
+      }
+      return false;
+    }
+  }
+
+  // =====================================================
+  // ELIMINACIÓN REAL EN FIREBASE AUTHENTICATION
+  // =====================================================
+
+  Future<void> _solicitarEliminacionCuenta() async {
+    if (_cargando) return;
+
+    final usuario = _usuario;
+    final correo = usuario?.email;
+
+    if (usuario == null || correo == null || correo.isEmpty) {
+      _mensaje(
+        _t(
+          'No se pudo identificar tu cuenta.',
+          'Não foi possível identificar sua conta.',
+        ),
+      );
+      return;
+    }
+
+    // Paso 1: correo, palabra ELIMINAR y espera de 30 segundos.
+    final confirmado = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => ConfirmarEliminacionDialog(
+        correo: correo,
+        portugues: languageController.locale.languageCode == 'pt',
+      ),
+    );
+    if (!mounted || confirmado != true) return;
+
+    // Paso 2: reautenticación real con el proveedor de Firebase.
+    final identidadVerificada = await _verificarIdentidadParaEliminar(usuario);
+    if (!mounted || !identidadVerificada) return;
+
+    // Nunca eliminamos una cuenta distinta de la sesión inicial.
+    if (FirebaseAuth.instance.currentUser?.uid != usuario.uid) {
+      _mensaje(
+        _t(
+          'La sesión cambió. Operación cancelada.',
+          'A sessão mudou. Operação cancelada.',
+        ),
+      );
+      return;
+    }
+
+    // Paso 3: advertencia explícita sobre los datos que aún
+    // permanecen en Supabase. Es la última opción de cancelar.
+    final eliminarSoloFirebase = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(_t('Última confirmación', 'Última confirmação')),
+        content: Text(
+          _t(
+            'Esta versión eliminará realmente tu cuenta de Firebase '
+                'Authentication. Sin embargo, tus materias, tareas '
+                'y otros datos almacenados en Supabase NO se borrarán '
+                'todavía y podrían quedar inaccesibles.\n\n'
+                'Usá solamente una cuenta de prueba. ¿Querés continuar?',
+            'Esta versão excluirá de verdade sua conta do Firebase '
+                'Authentication. Porém, suas disciplinas, tarefas '
+                'e outros dados armazenados no Supabase NÃO serão '
+                'excluídos ainda e poderão ficar inacessíveis.\n\n'
+                'Use apenas uma conta de teste. Deseja continuar?',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: Text(_textos.commonCancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: Text(
+              _t('Eliminar solo Firebase', 'Excluir apenas Firebase'),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || eliminarSoloFirebase != true) return;
+
+    // La cuenta no debe haber cambiado durante la confirmación final.
+    if (FirebaseAuth.instance.currentUser?.uid != usuario.uid) {
+      _mensaje(
+        _t(
+          'La sesión cambió. Operación cancelada.',
+          'A sessão mudou. Operação cancelada.',
+        ),
+      );
+      return;
+    }
+
+    setState(() => _cargando = true);
+    try {
+      // Paso 4: BORRADO REAL del usuario actual de Firebase Auth.
+      // ATENCIÓN: NO elimina los registros de Supabase.
+      await usuario.delete();
+
+      // Limpiar la sesión de la API aun si el servidor responde 401.
+      try {
+        await ApiClient.instance.signOut();
+      } catch (error) {
+        debugPrint('No se pudo cerrar sesión en la API: $error');
+      }
+
+      // Firebase suele cerrar la sesión al eliminar la cuenta.
+      // Forzamos el cierre si aún queda una sesión local.
+      try {
+        await FirebaseAuth.instance.signOut();
+      } catch (error) {
+        debugPrint('No se pudo limpiar la sesión Firebase: $error');
+      }
+
+      if (!mounted) return;
+      final messenger = ScaffoldMessenger.of(context);
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+        (route) => false,
+      );
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text(
+            _t(
+              'Cuenta de Firebase eliminada. Los datos de Supabase '
+                  'siguen pendientes de eliminación.',
+              'Conta do Firebase excluída. Os dados do Supabase '
+                  'ainda precisam ser excluídos.',
+            ),
+          ),
+        ),
+      );
+    } on FirebaseAuthException catch (error) {
+      if (!mounted) return;
+      _mensaje(
+        error.code == 'requires-recent-login'
+            ? _t(
+                'Por seguridad, volvé a iniciar sesión y '
+                    'reintentá la eliminación.',
+                'Por segurança, entre novamente na conta '
+                    'e tente excluir outra vez.',
+              )
+            : _t(
+                'No se pudo eliminar la cuenta de Firebase: ${error.code}',
+                'Não foi possível excluir a conta do Firebase: ${error.code}',
+              ),
+      );
+    } catch (error) {
+      debugPrint('Error eliminando la cuenta de Firebase: $error');
+      if (mounted) {
+        _mensaje(
+          _t(
+            'No fue posible confirmar la eliminación.',
+            'Não foi possível confirmar a exclusão.',
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _cargando = false);
+    }
+  }
+
+  // =====================================================
   // COMPONENTES VISUALES
   // =====================================================
 
@@ -999,8 +1309,10 @@ class _ProfileScreenState extends State<ProfileScreen> {
         alignment: Alignment.centerLeft,
         child: Text(
           texto.toUpperCase(),
-          style: Theme.of(context).textTheme.labelMedium
-              ?.copyWith(fontWeight: FontWeight.bold, letterSpacing: 1.0),
+          style: Theme.of(context).textTheme.labelMedium?.copyWith(
+            fontWeight: FontWeight.bold,
+            letterSpacing: 1.0,
+          ),
         ),
       ),
     );
@@ -1346,6 +1658,45 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           titulo: _textos.authLogout,
                           peligro: true,
                           onTap: _cargando ? null : _cerrarSesion,
+                        ),
+
+                        // ELIMINAR CUENTA - OPCION DISCRETA
+                        const SizedBox(height: 8),
+
+                        Card(
+                          margin: const EdgeInsets.only(bottom: 9),
+                          elevation: 0,
+                          color: Theme.of(context).brightness == Brightness.dark
+                              ? const Color(0xFF312628)
+                              : const Color(0xFFFBF5F6),
+                          child: ListTile(
+                            leading: const Icon(
+                              Icons.delete_outline,
+                              color: Color(0xFF9B626A),
+                            ),
+                            title: Text(
+                              _t('Eliminar cuenta', 'Excluir conta'),
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w500,
+                                color:
+                                    Theme.of(context).brightness ==
+                                        Brightness.dark
+                                    ? const Color(0xFFDCA8AF)
+                                    : const Color(0xFF965E66),
+                              ),
+                            ),
+                            subtitle: Text(
+                              _t(
+                                'Acción permanente e irreversible',
+                                'Ação permanente e irreversível',
+                              ),
+                            ),
+                            trailing: const Icon(Icons.chevron_right, size: 18),
+                            onTap: _cargando
+                                ? null
+                                : _solicitarEliminacionCuenta,
+                          ),
                         ),
 
                         if (_cargando)
